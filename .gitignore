@@ -34,3 +34,9 @@ dist/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+CLAUDE.md
+
+# Captured MCP evidence (competition data)
+tests/fixtures/evidence/
+.llm_cache/
