@@ -1,6 +1,7 @@
 """Specialist agents: order/product, shipment, payment/refund and policy.
 
-Phase 1 (``collect``): each specialist fetches only its own tools, in parallel.
+Phase 1 (``collect``): each specialist fetches only its own tools, in parallel. The shipment
+summary is fetched afterwards (``collect_shipment``) and only when it can change the decision.
 Phase 2 (``analyze``): once the complaint incident is known, each specialist analyses its
 domain for that incident and hands its report back to the coordinator.
 """
@@ -15,18 +16,23 @@ from typing import Any
 from ..evidence import Evidence
 from ..facts import Incident, as_list
 from ..rules import (
+    BENIGN_ISSUES,
     PRIMARY_ISSUES,
     PaymentAnalysis,
     PolicyParams,
     ShipmentAnalysis,
     analyze_payment,
     analyze_shipment,
+    issue_candidates,
     parse_policy,
 )
 from .context import CaseContext, EntityReport, IntakeReport
 
 ORDER, SHIPMENT, PAYMENT, POLICY = "order-agent", "shipment-agent", "payment-agent", "policy-agent"
 _POLICY_CACHE: dict[str, PolicyParams] = {}  # keyed by result_hash: content, never refs
+# Claimed issues that are decided on delivery evidence (or need it to be ruled out).
+SHIPMENT_TOPICS = frozenset({"late_delivery_seller", "late_delivery_logistics",
+                             "canceled_order_paid", "unavailable_order_paid", "unsupported_claim"})
 
 
 @dataclass
@@ -52,10 +58,6 @@ async def _order_agent(ctx: CaseContext, intake: IntakeReport, order_id: str, ou
         out.product = await ctx.store.fetch(ORDER, "get_product_context", order_id=order_id)
 
 
-async def _shipment_agent(ctx: CaseContext, order_id: str, out: Collected):
-    out.shipment = await ctx.store.fetch(SHIPMENT, "get_shipment_summary", order_id=order_id)
-
-
 async def _payment_agent(ctx: CaseContext, order_id: str, out: Collected):
     out.payment = await ctx.store.fetch(PAYMENT, "get_payment_timeline", order_id=order_id)
     # A tool error here usually means "no refund records"; it is not retried.
@@ -76,13 +78,39 @@ async def collect(ctx: CaseContext, intake: IntakeReport, entity: EntityReport) 
     if order_id:
         jobs += [
             (_order_agent(ctx, intake, order_id, out), ORDER),
-            (_shipment_agent(ctx, order_id, out), SHIPMENT),
             (_payment_agent(ctx, order_id, out), PAYMENT),
         ]
     for _, agent in jobs:
         bus.assign("coordinator", agent, "investigate")
     await asyncio.gather(*(job for job, _ in jobs))
     return out
+
+
+def shipment_needed(intake: IntakeReport, incidents: list[Incident], incident: Incident | None,
+                    collected: Collected) -> bool:
+    """Whether the shipment summary can still change the output for this incident.
+
+    It cannot when the order id covers a single purchase (so the per-order summary cannot
+    contradict the complaint's incident), the customer raises no delivery issue, the order
+    record already shows a complete, on-time delivery, and payment/refund evidence alone
+    confirms an actionable issue the customer claimed. Otherwise the summary is fetched.
+    """
+    if incident is None or len(incidents) != 1 or incident.status != "delivered":
+        return True
+    if any(topic in SHIPMENT_TOPICS for topic in intake.issue_topics):
+        return True
+    without_events = analyze_shipment(incident, intake.opened_at)
+    if without_events.verdict != "on_time" or not without_events.timeline_complete:
+        return True
+    payment = analyze_payment(incident, collected.payment is not None, intake.opened_at)
+    confirmed = {c.issue for c in issue_candidates(incident, without_events, payment)
+                 if c.issue not in BENIGN_ISSUES and "shipment" not in c.domains}
+    return not confirmed.intersection(intake.issue_topics)
+
+
+async def collect_shipment(ctx: CaseContext, order_id: str, out: Collected) -> None:
+    ctx.bus.assign("coordinator", SHIPMENT, "investigate")
+    out.shipment = await ctx.store.fetch(SHIPMENT, "get_shipment_summary", order_id=order_id)
 
 
 async def policy_params(ctx: CaseContext, collected: Collected) -> PolicyParams:
@@ -154,9 +182,10 @@ def analyze(
                evidence_refs=store.refs_for("get_order_items", "get_sellers",
                                             "get_product_context"),
                attributes={"items": len(incident.items) if incident else 0})
-    bus.report(SHIPMENT, "coordinator", "investigate", shipment.verdict.upper(),
-               evidence_refs=store.refs_for("get_shipment_summary"),
-               attributes={"timeline_complete": shipment.timeline_complete})
+    if collected.shipment is not None:
+        bus.report(SHIPMENT, "coordinator", "investigate", shipment.verdict.upper(),
+                   evidence_refs=store.refs_for("get_shipment_summary"),
+                   attributes={"timeline_complete": shipment.timeline_complete})
     bus.report(PAYMENT, "coordinator", "investigate", payment.verdict.upper(),
                evidence_refs=store.refs_for("get_payment_timeline", "get_refund_timeline"),
                attributes={"captured": float(payment.captured or 0)})

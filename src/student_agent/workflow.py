@@ -12,7 +12,14 @@ from .agents.adjudicator import DOMAIN_TOOLS, Decision, adjudicate, resolve_conf
 from .agents.context import CaseContext, EntityReport, IntakeReport
 from .agents.entity import resolve_entity
 from .agents.intake import REFUND_TOPIC, run_intake
-from .agents.specialists import Collected, analyze, collect, policy_params
+from .agents.specialists import (
+    Collected,
+    analyze,
+    collect,
+    collect_shipment,
+    policy_params,
+    shipment_needed,
+)
 from .agents.verifier import ISSUE_PAYMENT, verify
 from .evidence import CaseEvidenceStore, Gateway
 from .facts import Incident, build_incidents
@@ -61,20 +68,10 @@ async def solve_case(
     collected = await collect(ctx, intake, entity)
     policy = await policy_params(ctx, collected)
 
-    incidents: list[Incident] = []
-    incident = None
-    if entity.order_id:
-        incidents = build_incidents(
-            entity.order_id,
-            entity.history_rows,
-            entity.order_row,
-            collected.item_rows,
-            collected.payment.data if collected.payment else None,
-            collected.refund.data if collected.refund else None,
-            collected.shipment.data if collected.shipment else None,
-        )
-        incident = choose_incident(incidents, intake.opened_at, intake.issue_topics,
-                                   collected.payment is not None)
+    incidents, incident = _incidents(intake, entity, collected)
+    if entity.order_id and shipment_needed(intake, incidents, incident, collected):
+        await collect_shipment(ctx, entity.order_id, collected)
+        incidents, incident = _incidents(intake, entity, collected)
     shipment, payment = analyze(ctx, incident, collected, intake.opened_at)
 
     bus.assign(COORDINATOR, "conflict-resolver", "conflicts")
@@ -88,6 +85,23 @@ async def solve_case(
                evidence_refs=output["evidence_refs"])
     unresolved = sum(1 for c in conflicts if c["selected_source"] is None)
     return verify(ctx, output, intake.candidates, decision.path, unresolved)
+
+
+def _incidents(intake: IntakeReport, entity: EntityReport,
+               collected: Collected) -> tuple[list[Incident], Incident | None]:
+    if not entity.order_id:
+        return [], None
+    incidents = build_incidents(
+        entity.order_id,
+        entity.history_rows,
+        entity.order_row,
+        collected.item_rows,
+        collected.payment.data if collected.payment else None,
+        collected.refund.data if collected.refund else None,
+        collected.shipment.data if collected.shipment else None,
+    )
+    return incidents, choose_incident(incidents, intake.opened_at, intake.issue_topics,
+                                      collected.payment is not None)
 
 
 def _payment_verdict(decision: Decision, payment: PaymentAnalysis) -> str:

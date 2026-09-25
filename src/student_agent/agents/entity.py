@@ -23,7 +23,10 @@ async def resolve_entity(ctx: CaseContext, intake: IntakeReport) -> EntityReport
     history_rows: list[dict[str, Any]] = []
     customer_id: str | None = None
 
-    if intake.customer_hint:
+    # History is fetched when the scope asks for it, or when several candidates need it
+    # to be told apart; a single candidate is checked by get_order alone.
+    wants_history = intake.scope["include_customer_history"] or len(intake.candidates) > 1
+    if intake.customer_hint and wants_history:
         history = await store.fetch(ACTOR, "get_customer_history",
                                     customer_unique_id=intake.customer_hint)
         if history is not None:
