@@ -40,8 +40,6 @@ DEFAULT_PARTY = {
     "refund_pending": "payment_provider", "refund_failed": "payment_provider",
     "unsupported_claim": "customer", "valid_split_payment": "customer",
 }
-SHIPMENT_ISSUES = {"late_delivery_seller", "late_delivery_logistics", "unsupported_claim",
-                   "canceled_order_paid", "unavailable_order_paid", "insufficient_evidence"}
 BAND_CONFIDENCE = {"high": 0.75, "medium": 0.65, "low": 0.5}
 
 
@@ -176,14 +174,19 @@ def _confidence(decision: Decision, intake: IntakeReport, entity: EntityReport,
     return round(max(0.05, min(base, entity.confidence, 0.97)), 2)
 
 
-def _evidence_refs(ctx: CaseContext, intake: IntakeReport, issue: str, incident: Incident | None,
-                   conflicts: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """Refs per domain that the final answer actually relies on."""
-    wanted = ["order", "customer", "item", "payment", "policy"]
-    conflict_tools = {s for c in conflicts for s in c["sources"]}
-    if issue in SHIPMENT_ISSUES or "get_shipment_summary" in conflict_tools:
-        wanted.append("shipment")
-    if issue.startswith("refund_") or (incident is not None and incident.refund_events):
+def _evidence_refs(ctx: CaseContext, intake: IntakeReport, issue: str,
+                   incident: Incident | None) -> dict[str, list[str]]:
+    """Refs per domain that the final answer actually relies on.
+
+    Every fetched shipment summary is kept: it is the delivery evidence the verdict (or the
+    ruling-out of a delivery issue) rests on. Refund evidence is kept whenever the order has
+    any and a refund is requested, since that is what the request is judged against, even
+    when the refund events belong to another purchase of the same order.
+    """
+    wanted = ["order", "customer", "item", "payment", "policy", "shipment"]
+    refund_claimed = any(c.topic == REFUND_TOPIC for c in intake.claims)
+    if (issue.startswith("refund_") or refund_claimed
+            or (incident is not None and incident.refund_events)):
         wanted.append("refund")
     if intake.scope["include_product_context"]:
         wanted.append("product")
@@ -215,8 +218,8 @@ def _claims(intake: IntakeReport, decision: Decision, refund: Decimal,
             verdict = "partially_supported"
         else:
             verdict = "unsupported"
-        linked = refs.get("payment", []) + refs.get("policy", []) if claim.topic == REFUND_TOPIC \
-            else all_refs
+        linked = (refs.get("payment", []) + refs.get("refund", []) + refs.get("policy", [])
+                  if claim.topic == REFUND_TOPIC else all_refs)
         out.append({"claim_id": claim.claim_id, "verdict": verdict, "confidence": confidence,
                     "evidence_refs": list(dict.fromkeys(linked))[:30]})
     return out
@@ -240,7 +243,7 @@ def build_output(
         actions = ["escalate_for_investigation" if status == "needs_investigation"
                    else "document_no_action" if status == "no_action" else "review_case"]
     confidence = _confidence(decision, intake, entity, conflicts)
-    refs = _evidence_refs(ctx, intake, issue, incident, conflicts)
+    refs = _evidence_refs(ctx, intake, issue, incident)
     evidence_refs = list(dict.fromkeys(r for rs in refs.values() for r in rs))[:30]
 
     return {
