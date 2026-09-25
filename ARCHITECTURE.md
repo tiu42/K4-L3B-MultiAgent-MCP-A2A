@@ -273,8 +273,8 @@ Nếu LLM chọn một issue nằm ngoài `rule_candidates` (khi tập này khô
 | --- | --- | --- |
 | Lõi | `get_order`, `get_order_items`, `get_shipment_summary`, `get_payment_timeline`, `get_refund_timeline`, `get_policy` | Luôn gọi (khi đã resolve order) |
 | Theo scope | `get_customer_history` (`include_customer_history`), `get_product_context` (`include_product_context`) | Chỉ khi flag bật, hoặc cần cho entity resolution |
-| Điều kiện | `get_sellers` | Items thiếu seller info và cần xác định seller trách nhiệm |
-| Điều kiện | `get_order_payments` | Cần đối chiếu độc lập khi nghi mismatch/duplicate, hoặc `require_independent_verification` và payment là domain trọng tâm |
+| Điều kiện | `get_sellers` | Items thiếu seller info, hoặc kết luận quy trách nhiệm cho seller (bước `verify_seller` sau adjudicate) |
+| Điều kiện | `get_order_payments` | `require_independent_verification` và issue kết luận dựa trên capture (`duplicate_charge`, `payment_mismatch`, `valid_split_payment`); lệch với timeline → data conflict `payment_records` |
 | Điều kiện | thêm `get_order` | Entity resolution cần, tối đa K |
 | **Trần cứng** | | 12 call/case. Chạm trần thì chốt với evidence đang có |
 

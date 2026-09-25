@@ -22,7 +22,7 @@ from .agents.specialists import (
 )
 from .agents.verifier import ISSUE_PAYMENT, verify
 from .evidence import CaseEvidenceStore, Gateway
-from .facts import Incident, build_incidents
+from .facts import AMOUNT, Incident, as_list, build_incidents, money, pick
 from .llm import LLMClient
 from .rules import PaymentAnalysis, PolicyParams, ShipmentAnalysis, choose_incident
 from .trace import TraceWriter
@@ -41,6 +41,9 @@ DEFAULT_PARTY = {
     "unsupported_claim": "customer", "valid_split_payment": "customer",
 }
 BAND_CONFIDENCE = {"high": 0.75, "medium": 0.65, "low": 0.5}
+# Issues decided on captured amounts: re-checked against the independent payments table.
+CAPTURE_ISSUES = frozenset({"duplicate_charge", "payment_mismatch", "valid_split_payment"})
+CAPTURE_KINDS = frozenset({"captured", "capture", "charged"})
 
 
 def _llm() -> LLMClient:
@@ -76,6 +79,7 @@ async def solve_case(
     conflicts = resolve_conflicts(ctx, entity, incident, collected, incidents)
     bus.assign(COORDINATOR, "adjudicator", "adjudicate")
     decision = await adjudicate(ctx, intake, entity, incident, shipment, payment, conflicts)
+    await _verify(ctx, intake, entity, decision, policy, shipment, collected, conflicts)
 
     output = build_output(ctx, intake, entity, incident, collected, shipment, payment,
                           policy, conflicts, decision)
@@ -83,6 +87,53 @@ async def solve_case(
                evidence_refs=output["evidence_refs"])
     unresolved = sum(1 for c in conflicts if c["selected_source"] is None)
     return verify(ctx, output, intake.candidates, decision.path, unresolved)
+
+
+async def _verify(
+    ctx: CaseContext, intake: IntakeReport, entity: EntityReport, decision: Decision,
+    policy: PolicyParams, shipment: ShipmentAnalysis, collected: Collected,
+    conflicts: list[dict[str, Any]],
+) -> None:
+    """Fetch independent evidence for what the decision rests on (ARCHITECTURE.md §6)."""
+    order_id = entity.order_id
+    if not order_id:
+        return
+    if intake.scope["require_independent_verification"] and decision.issue in CAPTURE_ISSUES:
+        ctx.bus.assign(COORDINATOR, "payment-agent", "verify_payment")
+        records = await ctx.store.fetch("payment-agent", "get_order_payments", order_id=order_id)
+        status = "PAYMENT_UNVERIFIED"
+        if records is not None:
+            status = "PAYMENT_VERIFIED"
+            if _capture_amounts(collected) != _record_amounts(records.data):
+                status = "PAYMENT_RECORDS_DIFFER"
+                conflicts.append({"field": "payment_records",
+                                  "sources": ["get_order_payments", "get_payment_timeline"],
+                                  "selected_source": "get_payment_timeline",
+                                  "resolution_code": "EVENT_TIMELINE_PRECEDENCE"})
+        ctx.bus.report("payment-agent", COORDINATOR, "verify_payment", status,
+                       evidence_refs=ctx.store.refs_for("get_order_payments"))
+    rule = policy.rules.get(decision.issue)
+    seller_blamed = bool(shipment.late_seller_ids) or any(
+        p.get("party_type") == "seller" for p in (rule.responsible_parties if rule else []))
+    if seller_blamed:
+        ctx.bus.assign(COORDINATOR, "order-agent", "verify_seller")
+        sellers = await ctx.store.fetch("order-agent", "get_sellers", order_id=order_id)
+        ctx.bus.report("order-agent", COORDINATOR, "verify_seller",
+                       "SELLER_VERIFIED" if sellers is not None else "SELLER_UNVERIFIED",
+                       evidence_refs=ctx.store.refs_for("get_sellers"))
+
+
+def _capture_amounts(collected: Collected) -> list[Decimal]:
+    events = as_list(collected.payment.data, "events") if collected.payment else []
+    amounts = (money(pick(e, AMOUNT)) for e in events
+               if str(e.get("event_type") or e.get("type") or "").lower() in CAPTURE_KINDS
+               and str(e.get("status") or "").lower() not in {"failed", "voided"})
+    return sorted(a for a in amounts if a is not None)
+
+
+def _record_amounts(data: Any) -> list[Decimal]:
+    amounts = (money(pick(r, AMOUNT)) for r in as_list(data, "payments"))
+    return sorted(a for a in amounts if a is not None)
 
 
 def _incidents(intake: IntakeReport, entity: EntityReport,
